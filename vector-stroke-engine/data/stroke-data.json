@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "width": 1024,
+    "height": 1024,
+    "totalPoints": 48732,
+    "layers": 5
+  },
+  "layers": [
+    {
+      "name": "outline",
+      "stroke": "#ffffff",
+      "points": [
+        { "x": 0.234, "y": 0.182 },
+        { "x": 0.235, "y": 0.183 },
+        { "x": 0.236, "y": 0.184 }
+      ]
+    },
+    {
+      "name": "eyes",
+      "stroke": "#ff4444",
+      "points": [
+        { "x": 0.402, "y": 0.389 },
+        { "x": 0.403, "y": 0.390 }
+      ]
+    }
+  ]
+}
