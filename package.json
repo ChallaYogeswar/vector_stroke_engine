@@ -1,0 +1,34 @@
+{
+  "name": "vector-stroke-engine",
+  "version": "0.1.0",
+  "description": "Client-side photo tool: upload, clean up, and render through five engines (2D, Sketch, Histogram, ASCII, 3D).",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=24.0.0"
+  },
+  "scripts": {
+    "dev": "vite --configLoader runner",
+    "build": "tsc -b && vite build --configLoader runner",
+    "preview": "vite preview --configLoader runner",
+    "test": "vitest run",
+    "typecheck": "tsc -b --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.185.1",
+    "@vitejs/plugin-react": "^6.1.1",
+    "jsdom": "^24.1.1",
+    "typescript": "^5.5.4",
+    "vite": "^8.3.0",
+    "vitest": "^4.1.11"
+  }
+}

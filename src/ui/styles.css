@@ -1,0 +1,523 @@
+/* ---------------------------------------------------------------------------
+   Design tokens — docs/build-spec.md section 6.
+
+   Theme is mode-dependent, not a global toggle: every mode is dark
+   (near-black graphite + one phosphor-green accent) except Histogram, which
+   flips to a warm off-white "print report" page with a dark-ink accent.
+   `html[data-mode]` is set imperatively in useEngine.ts whenever the active
+   mode changes — see that file for why this isn't a React state class.
+--------------------------------------------------------------------------- */
+
+:root {
+  --font-display: 'Fraunces', Georgia, serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* Dark shell — Sketch / 2D / ASCII / 3D */
+  --bg: #0b0c0e;
+  --surface: #15171b;
+  --surface-raised: #1c1f24;
+  --border: #262a30;
+  --text-primary: #e9eaec;
+  --text-secondary: #9ba0a8;
+  --text-tertiary: #5c6169;
+  --accent: #46e0a0;
+  --accent-strong: #7dffc7;
+  --danger: #ff6b6b;
+
+  color-scheme: dark;
+}
+
+html[data-mode='histogram'] {
+  /* Histogram — warm off-white "print report" page, dark-ink accent */
+  --bg: #f3efe4;
+  --surface: #fffdf8;
+  --surface-raised: #ffffff;
+  --border: #ddd5c2;
+  --text-primary: #1c1a16;
+  --text-secondary: #57524a;
+  --text-tertiary: #8b8477;
+  --accent: #23283d;
+  --accent-strong: #384267;
+  --danger: #b3261e;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  transition: background-color 0.25s ease, color 0.25s ease;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input {
+  font-family: inherit;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.app {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------------------------- Header ---------------------------- */
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 28px clamp(20px, 4vw, 48px) 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.app-title {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  font-weight: 600;
+  font-size: clamp(22px, 2.4vw, 30px);
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.app-title .app-title-accent {
+  color: var(--accent);
+}
+
+.app-subtitle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin: 0;
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  /* The subtitle is nowrap on desktop; on a phone it (plus the title) is wider
+     than the viewport and forced a horizontal scrollbar. Let the header wrap. */
+  .app-header {
+    flex-wrap: wrap;
+    gap: 6px 24px;
+  }
+
+  .app-subtitle {
+    white-space: normal;
+  }
+}
+
+/* ---------------------------- Layout ----------------------------- */
+
+.app-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(220px, 260px) 1fr;
+  gap: 0;
+}
+
+@media (max-width: 760px) {
+  .app-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.control-rail {
+  border-right: 1px solid var(--border);
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+@media (max-width: 760px) {
+  .control-rail {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+.rail-section-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin: 0 0 10px;
+}
+
+/* --------------------------- Upload control ------------------------ */
+
+.upload-dropzone {
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+  padding: 18px 14px;
+  text-align: center;
+  cursor: pointer;
+  background: var(--surface);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.upload-dropzone:hover,
+.upload-dropzone.is-dragging {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.upload-dropzone-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.upload-dropzone-label strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.upload-input {
+  display: none;
+}
+
+.upload-filename {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.upload-error {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+/* --------------------------- Mode switcher ------------------------- */
+
+.mode-switcher {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mode-button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.mode-button:hover {
+  color: var(--text-primary);
+  background: var(--surface);
+}
+
+.mode-button.is-active {
+  color: var(--text-primary);
+  border-left-color: var(--accent);
+  background: var(--surface);
+}
+
+/* --------------------------- Settings panel ------------------------- */
+
+.settings-panel {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.settings-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.settings-toggle:hover {
+  background: var(--surface-raised);
+}
+
+.settings-toggle-chevron {
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
+
+.settings-body {
+  padding: 14px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.settings-toggle-row input[type='checkbox'] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.settings-slider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.settings-slider-row.is-disabled {
+  opacity: 0.45;
+}
+
+.settings-slider-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.settings-slider-value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.settings-slider-row input[type='range'] {
+  accent-color: var(--accent);
+  width: 100%;
+  cursor: pointer;
+}
+
+.settings-slider-row input[type='range']:disabled {
+  cursor: not-allowed;
+}
+
+.settings-orbit-button {
+  margin-top: 2px;
+}
+
+.settings-empty-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+/* --------------------------- Export control ------------------------- */
+
+.export-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.export-button {
+  padding: 9px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+
+.export-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.export-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.export-button--secondary {
+  color: var(--text-secondary);
+}
+
+.export-message {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+.export-message--error {
+  color: var(--danger);
+}
+
+/* ----------------------------- Stage ------------------------------ */
+
+.stage-wrap {
+  padding: clamp(20px, 4vw, 48px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.stage-readout {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.stage-readout .status-ready {
+  color: var(--accent);
+}
+
+.stage-readout .status-error {
+  color: var(--danger);
+}
+
+.stage-frame {
+  position: relative;
+  flex: 1;
+  min-height: 360px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.stage-frame canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.stage-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  pointer-events: none;
+  text-align: center;
+  padding: 0 24px;
+}
+
+/* Viewfinder corner brackets — the one deliberate signature element. */
+.stage-bracket {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--accent);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.stage-bracket--tl {
+  top: -1px;
+  left: -1px;
+  border-right: none;
+  border-bottom: none;
+}
+
+.stage-bracket--tr {
+  top: -1px;
+  right: -1px;
+  border-left: none;
+  border-bottom: none;
+}
+
+.stage-bracket--bl {
+  bottom: -1px;
+  left: -1px;
+  border-right: none;
+  border-top: none;
+}
+
+.stage-bracket--br {
+  bottom: -1px;
+  right: -1px;
+  border-left: none;
+  border-top: none;
+}
+
+/* --------------------------- Telemetry footer ----------------------- */
+
+.telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  padding: 14px clamp(20px, 4vw, 48px);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.telemetry-item strong {
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-right: 6px;
+}

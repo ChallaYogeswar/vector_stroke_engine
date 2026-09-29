@@ -1,0 +1,19 @@
+# dependencies & build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# secrets — ANTHROPIC_API_KEY lives in .env.local and must never be committed
+.env
+.env.*
+!.env.example
+*.local
+
+# deployment / tooling
+.vercel/
+
+# logs & OS/editor noise
+*.log
+.DS_Store
+.vscode/
+.idea/
