@@ -5,62 +5,57 @@ import { cellRange, clamp, clamp01 } from '../math';
 import { readThemeColors } from '../theme';
 
 // ---------------------------------------------------------------------------
-// 3D — "WebGL depth/relief render" (build-spec 3.2 #5), separate stack
-// (Three.js/WebGL), built last since it has the most moving parts.
+// 3D — a photo hung like a picture and pushed into a smooth relief, viewed
+// with a stable, user-controlled camera.
 //
-// process() (once per upload/mode-switch):
-//   1. Downsample the cleaned image to a coarse `cols x rows` grid (a
-//      couple thousand cells at most — a mesh, not a photo, so it doesn't
-//      need per-pixel resolution) — same aspect-preserving, non-upsampling
-//      scale-to-fit approach ModeASCII's grid uses, just with a bigger
-//      target since a mesh vertex is cheaper than a monospace glyph.
-//   2. Per cell: average RGB (-> vertex color) and Rec.709 luminance
-//      (-> raw height), same weights ModeSketch/ModeHistogram/cleanup.ts
-//      all use.
-//   3. Smooth the raw height field with cleanup.ts's box blur (a real reuse
-//      of Phase 1's shared infra, not just a matching implementation) —
-//      unsmoothed per-pixel luminance makes a visibly noisy, spiky mesh.
-//   4. Min-max normalize smoothed heights to 0..1, so relief depth reads
-//      consistently regardless of the photo's own luminance range.
+// process() (once per upload / mode switch / settings change):
+//   1. Downsample the cleaned image to a `cols x rows` grid (<= GRID_MAX_DIM
+//      per side, never upsampled) — this is only the *geometry* resolution.
+//      The photo itself is kept at full detail and applied as a texture, so
+//      the picture stays sharp even though the mesh is coarser.
+//   2. Height = luminance, smoothed very hard (two large box-blur passes) and
+//      percentile-normalised so a few blown highlights / crushed blacks can't
+//      flatten everything; a mild dome term (centre nearer than edges) makes
+//      it read as a rounded relief instead of rough terrain.
+//   3. Per-cell average color is kept for the 2D fallback path.
 //
-// render() — the interesting architectural decision:
+// render():
+//   The mesh lives in the XY plane (a picture on a wall, facing +Z) with
+//   height pushed toward the viewer along +Z. The camera sits on a sphere
+//   around it with user-controlled yaw / pitch / zoom:
+//     - the default view is fixed and front-facing (a small yaw/pitch shows
+//       depth), so a capture is always framed correctly — nothing spins
+//       unless the user turns "Auto sway" on;
+//     - yaw / pitch are clamped, so the back and edge-on views are
+//       unreachable — this is the "stabilised" part;
+//     - `progress` only matters when autoSway is on, where it drives a gentle
+//       +/- sway around the current view (never a full revolution).
 //
-// RenderContext's `ctx` is CanvasRenderingContext2D-only (types.ts), and
-// every other mode + the Controller + useEngine.ts is written against
-// exactly that. The straightforward way to give this one mode WebGL would
-// be to widen RenderContext into a 2D/WebGL union and have Controller and
-// useEngine.ts branch on the active mode to hand out the right context type
-// — but a canvas can only ever bind ONE context type for its lifetime
-// (calling `.getContext('webgl')` on a canvas that's already vended a `2d`
-// context returns null, and vice versa), so that would also mean either a
-// second <canvas> element mounted only for this mode, or the app's one
-// canvas getting torn down and recreated on every switch into/out of 3D.
-// Real changes to Controller, useEngine.ts, and App.tsx, for one mode's
-// implementation detail.
-//
-// Instead: Mode3D owns a second canvas that never touches the DOM. It
-// builds a Three.js scene once, renders the relief mesh to that hidden
-// canvas every frame, and draws the result onto the RenderContext's real
-// 2D canvas with a single drawImage() — a standard render-to-texture-style
-// pattern. Every other mode, the Controller, and useEngine.ts stay exactly
-// as Phase 0-3 left them; nothing outside this file needs to know 3D is
-// WebGL underneath. If WebGL genuinely isn't available (headless/jsdom test
-// environments included — see engine.test.ts), `render()` falls back to a
-// 2D-canvas raking-light shading of the same height/color grid instead of
-// showing a dead viewport.
-//
-// `progress` drives a continuous camera orbit (angle = progress * 2*PI)
-// rather than a one-shot reveal like Sketch/Histogram/ASCII use — useEngine
-// puts the Timeline into loop mode specifically for '3d' so this actually
-// keeps turning instead of freezing after one lap. See Timeline.setLoop.
+// RenderContext's `ctx` stays 2D-only (types.ts): Mode3D renders into its own
+// hidden WebGL canvas and blits the result with drawImage(), so Controller,
+// useEngine and every other mode never learn 3D uses WebGL, and PNG export
+// captures exactly what's on screen. If WebGL is unavailable (or fails
+// mid-session) render() falls back to a 2D shaded version of the same grid.
 // ---------------------------------------------------------------------------
 
-const GRID_MAX_DIM = 96;
+const GRID_MAX_DIM = 200;
 const GRID_MIN_DIM = 8;
-const HEIGHT_SMOOTH_RADIUS = 1;
-const CAMERA_RADIUS = 2.6;
-const CAMERA_ELEVATION = 1.3;
-const CAMERA_FOV = 38;
+const HEIGHT_SMOOTH_RADIUS_FRACTION = 0.05; // of the longer grid side, per blur pass — large on purpose: soft volume, no cliffs
+const DOME_MIX = 0.35;
+const EDGE_FLATTEN_FRACTION = 0.1; // the outer 10% of each side eases down to zero depth, so the outline stays a clean rectangle
+const RELIEF_BASE_DEPTH = 0.26; // fraction of the plane's short edge at reliefMultiplier = 1
+const TEXTURE_MAX_DIM = 1400;
+const CAMERA_FOV = 36;
+const FIT_MARGIN = 1.1;
+
+const DEFAULT_YAW = 0.32;
+const DEFAULT_PITCH = 0.14;
+const YAW_LIMIT = 0.6; // ~34 degrees either way: never the back, edge-on, or a badly stretched oblique view
+const PITCH_MIN = -0.3;
+const PITCH_MAX = 0.5;
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 3;
+const SWAY_AMPLITUDE = 0.34; // radians either side of the current view
 
 interface WebGLState {
   renderer: THREE.WebGLRenderer;
@@ -70,36 +65,39 @@ interface WebGLState {
   mesh: THREE.Mesh | null;
   geometry: THREE.BufferGeometry | null;
   material: THREE.MeshStandardMaterial | null;
+  texture: THREE.Texture | null;
   width: number;
   height: number;
 }
 
 export interface Mode3DOptions {
-  /** Multiplies the relief extrusion height (0.55 × min(planeW, planeH) at 1.0×, unchanged from the original fixed constant). */
+  /** Multiplies the relief depth (1 = RELIEF_BASE_DEPTH of the plane's short edge). */
   reliefMultiplier: number;
+  /** Gentle back-and-forth sway of the camera. Off by default so the view is stable. */
+  autoSway: boolean;
 }
 
-export const DEFAULT_MODE3D_OPTIONS: Mode3DOptions = { reliefMultiplier: 1 };
-export const MODE3D_RELIEF_MULTIPLIER_RANGE = { min: 0.25, max: 2.5 } as const;
+export const DEFAULT_MODE3D_OPTIONS: Mode3DOptions = { reliefMultiplier: 1, autoSway: false };
+export const MODE3D_RELIEF_MULTIPLIER_RANGE = { min: 0.25, max: 3 } as const;
 
 export class Mode3D implements ModeEngine {
   readonly id = '3d' as const;
 
   private payload: Relief3DPayload | null = null;
+  private sourceImage: ImageData | null = null;
   private webglState: WebGLState | null = null;
   private webglFailed = false;
   private meshBuiltFor: Relief3DPayload | null = null;
   private options: Mode3DOptions = { ...DEFAULT_MODE3D_OPTIONS };
 
+  private yaw = DEFAULT_YAW;
+  private pitch = DEFAULT_PITCH;
+  private zoom = 1;
+
   /**
-   * See docs/controls-spec.md section 3.1 — additive, not part of the locked
-   * ModeEngine interface. Only affects buildMesh()'s heightScale, not
-   * process(), but controls-spec's "one rule" still routes this through a
-   * reprocess: process() always returns a fresh payload object even when
-   * the numbers are unchanged, and meshBuiltFor's reference check (below)
-   * treats that fresh reference as "stale mesh, rebuild" — which is exactly
-   * what picks up the new multiplier, with no separate invalidation path
-   * needed here.
+   * Additive to the locked ModeEngine interface (see docs/PROJECT_MAP.md).
+   * reliefMultiplier changes the mesh, which is rebuilt because process()
+   * always returns a fresh payload object (meshBuiltFor's reference check).
    */
   configure(options: Partial<Mode3DOptions>): void {
     this.options = {
@@ -108,7 +106,26 @@ export class Mode3D implements ModeEngine {
         MODE3D_RELIEF_MULTIPLIER_RANGE.min,
         MODE3D_RELIEF_MULTIPLIER_RANGE.max,
       ),
+      autoSway: options.autoSway ?? this.options.autoSway,
     };
+  }
+
+  /** Rotates the camera by the given radians (drag). Clamped so the back is never shown. */
+  orbitBy(deltaYaw: number, deltaPitch: number): void {
+    this.yaw = clamp(this.yaw + deltaYaw, -YAW_LIMIT, YAW_LIMIT);
+    this.pitch = clamp(this.pitch + deltaPitch, PITCH_MIN, PITCH_MAX);
+  }
+
+  /** Multiplies the zoom (scroll / pinch). */
+  zoomBy(factor: number): void {
+    this.zoom = clamp(this.zoom * factor, ZOOM_MIN, ZOOM_MAX);
+  }
+
+  /** Back to the default framing. */
+  resetView(): void {
+    this.yaw = DEFAULT_YAW;
+    this.pitch = DEFAULT_PITCH;
+    this.zoom = 1;
   }
 
   process(image: ImageData): Relief3DPayload {
@@ -131,9 +148,12 @@ export class Mode3D implements ModeEngine {
       }
     }
 
-    const smoothed = boxBlurChannel(rawHeights, cols, rows, HEIGHT_SMOOTH_RADIUS);
-    const heights = normalize(smoothed);
+    const radius = Math.max(1, Math.round(Math.max(cols, rows) * HEIGHT_SMOOTH_RADIUS_FRACTION));
+    const pass1 = boxBlurChannel(rawHeights, cols, rows, radius);
+    const smoothed = boxBlurChannel(Float64Array.from(pass1), cols, rows, radius);
+    const heights = shapeHeights(smoothed, cols, rows);
 
+    this.sourceImage = image;
     this.payload = { kind: 'relief3d', cols, rows, heights, colors };
     return this.payload;
   }
@@ -158,13 +178,15 @@ export class Mode3D implements ModeEngine {
         this.webglFailed = true;
       }
     }
-    renderReliefFallback(renderCtx, this.payload, progress);
+    renderReliefFallback(renderCtx, this.payload);
   }
 
   reset(): void {
     this.disposeWebGL();
     this.webglFailed = false; // a full reset earns a fresh attempt at WebGL init
     this.payload = null;
+    this.sourceImage = null;
+    this.resetView();
   }
 
   private disposeWebGL(): void {
@@ -173,6 +195,7 @@ export class Mode3D implements ModeEngine {
       if (state.mesh) state.scene.remove(state.mesh);
       state.geometry?.dispose();
       state.material?.dispose();
+      state.texture?.dispose();
       try {
         state.renderer.dispose();
         state.renderer.forceContextLoss();
@@ -207,15 +230,17 @@ export class Mode3D implements ModeEngine {
 
       const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 50);
 
-      scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-      const key = new THREE.DirectionalLight(0xffffff, 1.15);
-      key.position.set(-3, 4, 2.5);
+      // Mostly ambient so the photo keeps its own exposure and color; the key
+      // light is what makes the relief read (it rakes across the slopes).
+      scene.add(new THREE.AmbientLight(0xffffff, 1.35));
+      const key = new THREE.DirectionalLight(0xffffff, 2.3);
+      key.position.set(-3.2, 2.4, 2.6);
       scene.add(key);
-      const fill = new THREE.DirectionalLight(0xffffff, 0.3);
-      fill.position.set(3, 1.5, -2.5);
+      const fill = new THREE.DirectionalLight(0xffffff, 0.35);
+      fill.position.set(3, -1, 2);
       scene.add(fill);
 
-      this.webglState = { renderer, scene, camera, canvas, mesh: null, geometry: null, material: null, width: 0, height: 0 };
+      this.webglState = { renderer, scene, camera, canvas, mesh: null, geometry: null, material: null, texture: null, width: 0, height: 0 };
       return this.webglState;
     } catch {
       // No WebGL (unsupported, headless test environment, context limit hit
@@ -243,10 +268,27 @@ export class Mode3D implements ModeEngine {
       state.height = h;
     }
 
-    const angle = progress * Math.PI * 2;
-    state.camera.aspect = w / h;
-    state.camera.position.set(Math.sin(angle) * CAMERA_RADIUS, CAMERA_ELEVATION, Math.cos(angle) * CAMERA_RADIUS);
-    state.camera.lookAt(0, 0.05, 0);
+    const payload = this.payload!;
+    const aspect = payload.cols / payload.rows;
+    const planeW = aspect >= 1 ? 2 : 2 * aspect;
+    const planeH = aspect >= 1 ? 2 / aspect : 2;
+    const camAspect = w / h;
+
+    // Distance at which the whole picture just fits the viewport (either axis).
+    const halfNeeded = Math.max(planeH / 2, planeW / 2 / camAspect) * FIT_MARGIN;
+    const distance = halfNeeded / Math.tan((CAMERA_FOV * Math.PI) / 360) / this.zoom;
+
+    const sway = this.options.autoSway ? Math.sin(progress * Math.PI * 2) * SWAY_AMPLITUDE : 0;
+    const yaw = clamp(this.yaw + sway, -YAW_LIMIT, YAW_LIMIT);
+    const pitch = this.pitch;
+
+    state.camera.aspect = camAspect;
+    state.camera.position.set(
+      Math.sin(yaw) * Math.cos(pitch) * distance,
+      Math.sin(pitch) * distance,
+      Math.cos(yaw) * Math.cos(pitch) * distance,
+    );
+    state.camera.lookAt(0, 0, 0);
     state.camera.updateProjectionMatrix();
 
     state.renderer.render(state.scene, state.camera);
@@ -260,33 +302,30 @@ export class Mode3D implements ModeEngine {
       state.scene.remove(state.mesh);
       state.geometry?.dispose();
       state.material?.dispose();
+      state.texture?.dispose();
     }
 
-    const { cols, rows, heights, colors } = payload;
+    const { cols, rows, heights } = payload;
     const aspect = cols / rows;
     const planeW = aspect >= 1 ? 2 : 2 * aspect;
     const planeH = aspect >= 1 ? 2 / aspect : 2;
-    const heightScale = 0.55 * this.options.reliefMultiplier * Math.min(planeW, planeH);
+    const depth = RELIEF_BASE_DEPTH * this.options.reliefMultiplier * Math.min(planeW, planeH);
 
     const vertexCount = cols * rows;
     const positions = new Float32Array(vertexCount * 3);
-    const vertexColors = new Float32Array(vertexCount * 3);
+    const uvs = new Float32Array(vertexCount * 2);
 
+    // The picture hangs in the XY plane facing +Z; height pushes toward the viewer.
     for (let gy = 0; gy < rows; gy++) {
       for (let gx = 0; gx < cols; gx++) {
         const idx = gy * cols + gx;
-        const px = (gx / (cols - 1) - 0.5) * planeW;
-        const pz = (gy / (rows - 1) - 0.5) * planeH;
-        const py = heights[idx]! * heightScale;
-
-        positions[idx * 3] = px;
-        positions[idx * 3 + 1] = py;
-        positions[idx * 3 + 2] = pz;
-
-        const linear = srgbHexToLinearUnit(colors[idx]!);
-        vertexColors[idx * 3] = linear[0];
-        vertexColors[idx * 3 + 1] = linear[1];
-        vertexColors[idx * 3 + 2] = linear[2];
+        const u = gx / (cols - 1);
+        const v = gy / (rows - 1);
+        positions[idx * 3] = (u - 0.5) * planeW;
+        positions[idx * 3 + 1] = (0.5 - v) * planeH;
+        positions[idx * 3 + 2] = heights[idx]! * depth * edgeFade(u, v);
+        uvs[idx * 2] = u;
+        uvs[idx * 2 + 1] = 1 - v;
       }
     }
 
@@ -297,24 +336,64 @@ export class Mode3D implements ModeEngine {
         const b = a + 1;
         const c = a + cols;
         const d = c + 1;
-        indices.push(a, c, b, b, c, d);
+        indices.push(a, c, b, b, c, d); // counter-clockwise seen from +Z
       }
     }
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(vertexColors, 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.88, metalness: 0.04 });
+    const texture = this.sourceImage ? buildTexture(this.sourceImage) : null;
+    const material = new THREE.MeshStandardMaterial({
+      ...(texture ? { map: texture } : { color: 0x888888 }),
+      roughness: 0.92,
+      metalness: 0,
+    });
     const mesh = new THREE.Mesh(geometry, material);
 
     state.scene.add(mesh);
     state.mesh = mesh;
     state.geometry = geometry;
     state.material = material;
+    state.texture = texture;
   }
+}
+
+/** 0 on the border -> 1 once EDGE_FLATTEN_FRACTION in from every side (smoothstep). */
+function edgeFade(u: number, v: number): number {
+  const d = Math.min(u, 1 - u, v, 1 - v) / EDGE_FLATTEN_FRACTION;
+  const t = clamp01(d);
+  return t * t * (3 - 2 * t);
+}
+
+/** The full-detail photo as a texture (long edge capped at TEXTURE_MAX_DIM). */
+function buildTexture(image: ImageData): THREE.Texture {
+  const src = document.createElement('canvas');
+  src.width = image.width;
+  src.height = image.height;
+  src.getContext('2d')!.putImageData(image, 0, 0);
+
+  const k = Math.min(1, TEXTURE_MAX_DIM / Math.max(image.width, image.height));
+  let source: HTMLCanvasElement = src;
+  if (k < 1) {
+    source = document.createElement('canvas');
+    source.width = Math.max(1, Math.round(image.width * k));
+    source.height = Math.max(1, Math.round(image.height * k));
+    const g = source.getContext('2d')!;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(src, 0, 0, source.width, source.height);
+  }
+
+  const texture = new THREE.CanvasTexture(source);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.anisotropy = 4;
+  texture.needsUpdate = true;
+  return texture;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,16 +430,28 @@ function averageCell(
   return { r, g, b, luminance: 0.2126 * r + 0.7152 * g + 0.0722 * b };
 }
 
-function normalize(values: Float32Array): number[] {
-  let min = Infinity;
-  let max = -Infinity;
-  for (const v of values) {
-    if (v < min) min = v;
-    if (v > max) max = v;
-  }
-  const range = max - min || 1;
+/**
+ * Smoothed luminance -> relief heights in 0..1. Percentile-normalised (2nd..98th)
+ * so isolated highlights/blacks can't compress the useful range, plus a mild
+ * dome so the centre sits nearer than the edges.
+ */
+function shapeHeights(values: Float32Array, cols: number, rows: number): number[] {
+  const sorted = Float32Array.from(values).sort();
+  const lo = sorted[Math.floor(sorted.length * 0.02)] ?? 0;
+  const hi = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.98))] ?? 1;
+  const range = hi - lo || 1;
+
   const out = new Array<number>(values.length);
-  for (let i = 0; i < values.length; i++) out[i] = (values[i]! - min) / range;
+  for (let gy = 0; gy < rows; gy++) {
+    const v = rows > 1 ? gy / (rows - 1) - 0.5 : 0;
+    for (let gx = 0; gx < cols; gx++) {
+      const u = cols > 1 ? gx / (cols - 1) - 0.5 : 0;
+      const idx = gy * cols + gx;
+      const lum = clamp01((values[idx]! - lo) / range);
+      const dome = clamp01(1 - (u * u + v * v) * 3.2);
+      out[idx] = clamp01(lum * (1 - DOME_MIX) + dome * DOME_MIX);
+    }
+  }
   return out;
 }
 
@@ -374,25 +465,16 @@ function hexToRGB(hex: string): [number, number, number] {
   return [parseInt(clean.slice(0, 2), 16), parseInt(clean.slice(2, 4), 16), parseInt(clean.slice(4, 6), 16)];
 }
 
-/** Converts a `#rrggbb` (sRGB) color to Three's linear working color space, since a raw vertex-color BufferAttribute bypasses THREE.Color's usual automatic sRGB->linear conversion. */
-function srgbHexToLinearUnit(hex: string): [number, number, number] {
-  const [r, g, b] = hexToRGB(hex);
-  const linear = new THREE.Color().setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
-  return [linear.r, linear.g, linear.b];
-}
-
 // ---------------------------------------------------------------------------
 // 2D fallback — a raking-light shading of the same height/color grid,
-// approximating the WebGL relief's lighting with pure canvas fills. Reveals
-// row-by-row against `progress` (this path doesn't orbit, so progress is
-// free to drive a one-shot reveal instead — see the render() header comment
-// for why WebGL gets continuous rotation and this doesn't).
+// approximating the WebGL relief's lighting with pure canvas fills. Always
+// drawn in full (the camera controls only apply to the WebGL path).
 // ---------------------------------------------------------------------------
 
 const FALLBACK_LIGHT_X = -0.6;
 const FALLBACK_LIGHT_Z = -0.75;
 
-function renderReliefFallback(renderCtx: RenderContext, payload: Relief3DPayload, progress: number): void {
+function renderReliefFallback(renderCtx: RenderContext, payload: Relief3DPayload): void {
   const { ctx, width, height } = renderCtx;
   ctx.clearRect(0, 0, width, height);
 
@@ -406,11 +488,7 @@ function renderReliefFallback(renderCtx: RenderContext, payload: Relief3DPayload
   const offsetX = (width - cellSize * cols) / 2;
   const offsetY = (height - cellSize * rows) / 2;
 
-  let revealed = Math.floor(progress * rows);
-  if (progress > 0 && revealed === 0) revealed = 1;
-  revealed = Math.min(rows, revealed);
-
-  for (let gy = 0; gy < revealed; gy++) {
+  for (let gy = 0; gy < rows; gy++) {
     for (let gx = 0; gx < cols; gx++) {
       const idx = gy * cols + gx;
       const left = heights[gy * cols + Math.max(0, gx - 1)]!;

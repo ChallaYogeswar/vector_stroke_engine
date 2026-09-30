@@ -16,8 +16,7 @@ export function App() {
     currentOutput,
     controls,
     updateControls,
-    isOrbitPlaying,
-    toggleOrbit,
+    resetView,
     switchMode,
     loadFile,
   } = useEngine(canvasRef);
@@ -39,8 +38,7 @@ export function App() {
             activeMode={activeMode}
             controls={controls}
             onUpdateControls={updateControls}
-            isOrbitPlaying={isOrbitPlaying}
-            onToggleOrbit={toggleOrbit}
+            onResetView={resetView}
             currentOutput={currentOutput}
           />
           <ExportControl
@@ -65,6 +63,9 @@ export function App() {
             <span className="stage-bracket stage-bracket--tr" />
             <span className="stage-bracket stage-bracket--bl" />
             <span className="stage-bracket stage-bracket--br" />
+            {imageSummary && activeMode === '3d' && (
+              <div className="stage-hint">Drag to rotate · Scroll to zoom · Double-click to reset</div>
+            )}
             {!imageSummary && (
               <div className="stage-empty">
                 Upload a photo to run it through the {activeMode.toUpperCase()} engine

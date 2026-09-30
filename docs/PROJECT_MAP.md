@@ -45,10 +45,10 @@ sharpen, in a Web Worker); then it is rendered by one of five engines onto a sin
 | Mode id | What it renders | Theme |
 |---|---|---|
 | `2d` | Posterized, flat "vector-style" image | dark |
-| `sketch` | Animated pen-stroke reveal from Sobel edges (flagship) | dark |
+| `sketch` | Animated pen-stroke line drawing: Canny-style contours traced into smooth strokes + optional hatching (flagship) | dark |
 | `histogram` | R/G/B + luminance distribution chart | **light** ("print report") |
 | `ascii` | Character-art with typewriter reveal | dark |
-| `3d` | WebGL bas-relief mesh with orbiting camera (2D fallback if no WebGL) | dark |
+| `3d` | Photo hung like a picture and pushed into a smooth WebGL relief; stable, user-controlled camera (drag/zoom/reset, optional sway); 2D fallback if no WebGL | dark |
 
 Extras: settings drawer (cleanup toggles + per-mode sliders), export (PNG for all; SVG for Sketch,
 TXT for ASCII, CSV for Histogram; Web Share API where available), and an **optional** Vercel
@@ -230,13 +230,15 @@ vector-stroke-engine/
     │   │   └── cleanup-client.ts     main-thread worker client + sync fallback
     │   ├── modes/
     │   │   ├── mode-2d.ts
-    │   │   ├── mode-sketch.ts
+    │   │   ├── mode-sketch.ts        Sketch mode (options, process, batched render)
+    │   │   ├── sketch-trace.ts       pure tone-map / Canny edges / contour tracing / hatching
     │   │   ├── mode-histogram.ts
     │   │   ├── mode-ascii.ts
-    │   │   └── mode-3d.ts
+    │   │   └── mode-3d.ts            picture-relief WebGL + camera controls
     │   └── __tests__/
     │       ├── test-utils.ts         jsdom polyfills + mock canvas
     │       ├── engine.test.ts        cleanup, controller, all five modes
+    │       ├── sketch-trace.test.ts  tone map, edges, tracing, polyline helpers, hatching
     │       ├── export.test.ts
     │       └── cleanup-worker.test.ts
     └── ui/
@@ -412,27 +414,43 @@ render(ctx, _p)                  // no payload → no-op; else clearRect, lazily
 reset()
 ```
 
-### 6.9 `modes/mode-sketch.ts` — `class ModeSketch` (`id: 'sketch'`) — flagship
-Constants: `POINT_BUDGET 2200`, `MIN_CELL_SIZE 2`, `EDGE_PERCENTILE 0.88`, `MAX_JUMP_FACTOR 2.75`, `MIN_STROKE_POINTS 2`, `LONG_STROKE_POINTS 6`, `DEFAULT_STROKE_WIDTH 1.4`.
-```ts
-export interface SketchOptions { edgePercentile: number; pointBudget: number; strokeWidth: number }
-export const DEFAULT_SKETCH_OPTIONS = { edgePercentile: 0.88, pointBudget: 2200, strokeWidth: 1.4 };
-export const SKETCH_EDGE_PERCENTILE_RANGE = { min: 0.7, max: 0.97 } as const;   // lower = denser
-export const SKETCH_POINT_BUDGET_RANGE    = { min: 500, max: 8000 } as const;   // pointBudget rounded
-export const SKETCH_STROKE_WIDTH_RANGE    = { min: 0.5, max: 3 } as const;
-configure(partial)  // clamps all three
-export function orderIntoPaths(points: Point[], maxJump: number): Point[][]   // exported for tests
-```
-`process()` pipeline:
-1. Luminance `Float32Array`.
-2. **Sobel** magnitude (3×3, borders clamped): `gx = −tl+tr −2l+2r −bl+br`, `gy = −tl−2t−tr+bl+2b+br`, `mag = √(gx²+gy²)`.
-3. **Percentile threshold**: 256-bin histogram over `[0,max]`; walk from the top bin down until cumulative ≥ `N×(1−percentile)`; return `bin/scale` (0 if `max ≤ 0`).
-4. **Grid sampling**: `cell = max(2, round(√(w·h / pointBudget)))`; each `cell×cell` block contributes at most its single strongest pixel with `mag > threshold`.
-5. **`orderIntoPaths(points, cell × 2.75)`** — greedy nearest-neighbour walk. Start = next unvisited index (monotonic cursor, O(n) total); repeatedly step to the nearest *unvisited* point; if its distance > `maxJump` the stroke ends (pen lift). Implemented with a **uniform spatial hash grid** (`Map<"gx,gy", number[]>`, cell size = `maxJump`, 3×3 neighbourhood query; visited points are removed from their bucket by swap-pop). This is an *exact* replacement for the brute-force O(n²) scan (any point within `maxJump` lies in the query cell or one of its 8 neighbours) and is cross-checked against a brute-force reference in tests.
-6. Keep paths with ≥ 2 points → `Layer { name: 'Stroke i', stroke, points }`; `stroke` = `theme.accentStrong` if length ≥ 6 else `withAlpha(theme.accent, 0.6)`.
-7. `meta = { width, height, totalPoints, layers }`.
+### 6.9 `modes/sketch-trace.ts` + `modes/mode-sketch.ts` — Sketch (`id: 'sketch'`) — flagship
 
-`render(ctx, progress)`: clear; no data → return; `totalPoints === 0` → centered text `NO STRONG EDGES DETECTED` (`400 13px "JetBrains Mono", monospace`, `textTertiary`). Else scale-to-fit + center; `budget = floor(progress × totalPoints)` (min 1 if progress > 0); layers consume budget in order; `lineJoin/lineCap = round`; each layer drawn as one path (≥ 2 points) with `lineWidth = options.strokeWidth`, `shadowBlur` 1.5 when complete / 6 while in progress; the in-progress stroke also gets a 1.8 px pen-tip dot (`shadowBlur` 8) at its last revealed point.
+**History / why it is built this way.** The first version sampled one strongest-edge pixel per grid cell and joined them with a nearest-neighbour walk. On real photos (especially dark ones) that produced a *maze of zig-zag squiggles*, not a drawing, because it never followed actual contours and had no exposure handling. It was replaced wholesale by the pipeline below (the old `orderIntoPaths`, `pointBudget`, `edgePercentile`, spatial-hash code and their tests are gone).
+
+#### `sketch-trace.ts` (pure functions, no canvas/theme; works in a *working space* with long edge ≤ `WORKING_MAX_DIM = 720`)
+```ts
+export const WORKING_MAX_DIM = 720;  export const EDGE_BLUR_SIGMA = 1.3;
+export interface ToneMap { width; height; sx; sy; tone: Float32Array }   // sx/sy = source px per working px (>=1)
+export function buildToneMap(image: ImageData, maxDim = 720): ToneMap
+export function gaussianBlur(src: Float32Array, w, h, sigma): Float32Array          // separable, edges clamped
+export function detectEdges(tone, w, h, sensitivity: number): Uint8Array            // 1 = edge pixel
+export interface TracedStroke { points: Point[] /*working space*/; length: number /*px, pre-simplification*/ }
+export function traceContours(edges, w, h, minLength: number): TracedStroke[]
+export function smoothPolyline(points, passes): Point[]                             // [1 2 1]/4, endpoints pinned
+export function simplifyPolyline(points, tolerance): Point[]                        // iterative Ramer–Douglas–Peucker
+export interface HatchStroke { a: Point; b: Point; level: 0 | 1 | 2 }
+export function buildHatching(tone, w, h, shading: number): HatchStroke[]
+```
+- **buildToneMap**: area-average downscale of Rec.709 luminance (`factor = max(1, longEdge/maxDim)`, never upsamples), then **auto-level**: stretch the 1st–99th percentile to 0..1, then a gamma (clamped 0.4–1.6) that moves the median to 0.5. This is what makes a dark/underexposed photo give the same quality of lines as a well-exposed one. **Near-flat images** (1st→99th percentile spread < 8) skip stretching and keep true brightness (`L/255`) — otherwise a plain white page would be treated as black and hatched everywhere (real bug caught by a test).
+- **detectEdges** (Canny recipe): Gaussian blur σ 1.3 → Sobel (÷4, so a full black→white step ≈ 1) → **non-maximum suppression** (gradient direction quantised to 4 axes; 1px-thin ridges; magnitudes < 0.02 ignored) → **hysteresis**: `keep = 0.08 + 0.42·sensitivity` is the fraction of ridge pixels treated as "sure" edges (`high` = that percentile, floored at `MIN_STRONG_EDGE = 0.07` so flat/noisy images yield *nothing* instead of a maze); `low = 0.42·high`; weak ridge pixels survive only if 8-connected to a sure edge (stack flood-fill).
+- **traceContours**: pass 1 starts walks at **endpoints** (exactly one neighbour) so open curves come out as single strokes; pass 2 handles loops/leftovers (walked both directions from the start pixel and merged). The walk prefers the neighbour that keeps the heading straightest (cosine with previous step, +0.05 bonus for 4-connected steps). Chains shorter than `minLength` are dropped. Kept chains → pixel centres (+0.5) → `smoothPolyline(…, 2)` → `simplifyPolyline(…, 0.65)`.
+- **buildHatching**: tone blurred σ 2.2; `t0 = 0.18 + 0.32·shading`; thresholds `[t0, 0.66·t0, 0.36·t0]` for levels 0/1/2 = 45° lines, −45° lines, horizontal lines (level 2 spacing ×1.5). Line spacing `max(4, round(longEdge/105))`. Each line is sampled every 1px; runs where tone < threshold and length ≥ `max(4, spacing)` become a 2-point stroke. `shading ≤ 0.001` → `[]`.
+
+#### `mode-sketch.ts`
+```ts
+export interface SketchOptions { sensitivity: number; minStrokeLength: number; shading: number; strokeWidth: number }
+export const DEFAULT_SKETCH_OPTIONS = { sensitivity: 0.65, minStrokeLength: 12, shading: 0.5, strokeWidth: 1.4 };
+export const SKETCH_SENSITIVITY_RANGE       = { min: 0.05, max: 1 }  as const;   // UI label "Detail"
+export const SKETCH_MIN_STROKE_LENGTH_RANGE = { min: 4,    max: 60 } as const;   // rounded; UI label "Line cleanup"; working-space px
+export const SKETCH_SHADING_RANGE           = { min: 0,    max: 1 }  as const;   // 0 = off
+export const SKETCH_STROKE_WIDTH_RANGE      = { min: 0.5,  max: 3 }  as const;
+configure(partial)   // clamps all four
+```
+`process(image)`: tone map → `detectEdges` → `traceContours` sorted **longest first** → layers `Contour i` (stroke = `theme.accentStrong`, points scaled to source coords by `sx/sy`) → hatching sorted by **`level` then `y`** (light pass sweeps top→bottom, then the crossing pass, then the deepest — like hatching/cross-hatching; grouping by tint is also what lets render batch) → layers `Shade i` (2 points; stroke = `accent` at alpha 0.55 / 0.47 / 0.40 for levels 0/1/2). `meta = { width, height, totalPoints, layers }` (source-image size).
+
+`render(ctx, progress)`: clear; no data → return; `totalPoints === 0` → centered `NO STRONG EDGES DETECTED`; scale-to-fit + center; `budget = floor(progress·totalPoints)` (min 1 if progress > 0). **Batching:** consecutive complete layers with the same `stroke` string share one `beginPath()…stroke()` (a flush happens only when the colour changes), so thousands of hatch lines cost ~4 draw calls/frame. Contours: `lineWidth = strokeWidth`, `shadowBlur 1.5`; hatch: `lineWidth = strokeWidth × 0.7`, no shadow. The one in-progress layer is drawn separately with `shadowBlur 6` plus a 1.8px glowing pen-tip dot. `lineJoin/lineCap = round`.
+Duration (in `useEngine`): `clamp(totalPoints × 18, 1200, 5000)` ms.
 
 ### 6.10 `modes/mode-histogram.ts` — `class ModeHistogram` (`id: 'histogram'`)
 No options. `process()`: one pass, 256 buckets each for R, G, B and luminance (`min(255, round(L))`); `maxCount = max(1, largest bucket across all four)`. `render()`: pad `{top 28, right 20, bottom 28, left 20}`; baseline axis in `theme.border`; legend row at `chartY − 14` (`LUMINANCE` in textSecondary, `RED #c1443c`, `GREEN #3f8f5c`, `BLUE #3f6fb0`; font `500 10px "JetBrains Mono"`); `rise = easeOutCubic(clamp01(progress))`; bar height = `√count / √maxCount × chartH × rise` (**sqrt scale**); luminance drawn first as filled silhouette (`accent` α 0.16 fill, α 0.55 outline), then R/G/B as 1.2 px lines at α 0.85. RGB lines use literal red/green/blue on purpose (an exception to theming).
@@ -449,22 +467,28 @@ configure(partial)   // undefined keeps current; null = auto; number → round +
 `render()`: `cellWidth = max(1, min(width/cols, (height/rows) × 0.5))`, `cellHeight = cellWidth / 0.5` (**rectangular cells**, so on-canvas art keeps the same proportions as the `.txt` export); grid centered; `revealed = floor(progress × total)` (min 1 if progress > 0), row-major; font `500 ${max(4, cellHeight×0.85)}px "JetBrains Mono", monospace`, centered glyphs; blanks skipped; fill = `withAlpha(accent, 0.3 + level×0.7)`, `shadowBlur 4` when `level > 0.55`; a terminal cursor block (`accentStrong` α 0.5) on the last revealed cell while `revealed < total`.
 
 ### 6.12 `modes/mode-3d.ts` — `class Mode3D` (`id: '3d'`)
-Constants: `GRID_MAX_DIM 96`, `GRID_MIN_DIM 8`, `HEIGHT_SMOOTH_RADIUS 1`, `CAMERA_RADIUS 2.6`, `CAMERA_ELEVATION 1.3`, `CAMERA_FOV 38`.
-```ts
-export interface Mode3DOptions { reliefMultiplier: number }
-export const DEFAULT_MODE3D_OPTIONS = { reliefMultiplier: 1 };
-export const MODE3D_RELIEF_MULTIPLIER_RANGE = { min: 0.25, max: 2.5 } as const;
-configure(partial)  // clamps
-```
-`process()`: `scale = min(1, 96/max(w,h))` (never upsample); `cols/rows = clamp(round(dim×scale), 8, 96)`; per cell: average RGB → `#rrggbb` color, luminance → raw height; heights smoothed with `boxBlurChannel(radius 1)` then **min-max normalized to 0..1**. Returns a **fresh payload object every call** (this is what invalidates the mesh — see below).
 
-`render(ctx, progress)`: no payload → clear. Else try WebGL; on any failure dispose and use the 2D fallback for the rest of the instance's life (`reset()` re-enables a WebGL attempt).
-- **Architecture:** `RenderContext.ctx` stays 2D-only. Mode3D owns a **hidden offscreen canvas** with a `THREE.WebGLRenderer` (`antialias: true, alpha: false, powerPreference: 'low-power'`, pixelRatio 1, `outputColorSpace = SRGBColorSpace`), renders each frame there, then `ctx.drawImage(offscreen, 0, 0, width, height)`. So Controller/UI/other modes never know 3D uses WebGL, and PNG export works unchanged.
-- **Scene:** background = `theme.surface`; `AmbientLight(0xffffff, 0.55)`; key `DirectionalLight(0xffffff, 1.15)` at (−3, 4, 2.5); fill `DirectionalLight(0xffffff, 0.3)` at (3, 1.5, −2.5); `PerspectiveCamera(38, aspect, 0.1, 50)`.
-- **Mesh** (rebuilt whenever `meshBuiltFor !== payload`): plane width/height 2 on the longer axis, aspect preserved; `heightScale = 0.55 × reliefMultiplier × min(planeW, planeH)`; `position = ((gx/(cols−1) − 0.5)·planeW, h·heightScale, (gy/(rows−1) − 0.5)·planeH)`; vertex colors converted sRGB→linear via `THREE.Color().setRGB(..., SRGBColorSpace)` (raw vertex-color attributes bypass automatic conversion); two triangles per cell with indices `(a,c,b),(b,c,d)`; `computeVertexNormals()`; `MeshStandardMaterial({ vertexColors: true, roughness: 0.88, metalness: 0.04 })`.
-- **Camera:** `angle = progress × 2π`; position `(sin·2.6, 1.3, cos·2.6)`; `lookAt(0, 0.05, 0)`.
-- **2D fallback** (also what jsdom tests exercise): per cell, gradient from neighbouring heights against a fixed light `(−0.6, −0.75)`: `shade = clamp01(0.55 + (dx·−0.6 + dz·−0.75)·1.6 + h·0.15)`; rows revealed with `progress`; **letterboxed to the image aspect** (cell size uniform, grid centered) — this was the distortion fix in 2.3.
-- `disposeWebGL()`: removes mesh, disposes geometry/material/renderer, `forceContextLoss()` in try/catch.
+**History / why it is built this way.** The first version laid the photo flat on the *floor* (XZ plane), coloured it per-vertex on a ≤96×96 mesh (blocky), and spun the camera 360° forever — so you saw it edge-on, upside-down, or from behind and had to pause the orbit to capture anything. Now the photo hangs like a picture, keeps full resolution as a texture, and the camera holds still unless the user moves it.
+
+Constants: `GRID_MAX_DIM 200`, `GRID_MIN_DIM 8`, `HEIGHT_SMOOTH_RADIUS_FRACTION 0.05` (of the longer grid side, per blur pass — deliberately large: soft volume, no cliffs), `DOME_MIX 0.35`, `EDGE_FLATTEN_FRACTION 0.1`, `RELIEF_BASE_DEPTH 0.26` (of the plane's short edge at ×1), `TEXTURE_MAX_DIM 1400`, `CAMERA_FOV 36`, `FIT_MARGIN 1.1`, `DEFAULT_YAW 0.32`, `DEFAULT_PITCH 0.14`, `YAW_LIMIT 0.6` (~34°), `PITCH_MIN −0.3`, `PITCH_MAX 0.5`, `ZOOM_MIN 0.6`, `ZOOM_MAX 3`, `SWAY_AMPLITUDE 0.34` rad.
+```ts
+export interface Mode3DOptions { reliefMultiplier: number; autoSway: boolean }
+export const DEFAULT_MODE3D_OPTIONS = { reliefMultiplier: 1, autoSway: false };
+export const MODE3D_RELIEF_MULTIPLIER_RANGE = { min: 0.25, max: 3 } as const;
+configure(partial)            // clamps reliefMultiplier; autoSway boolean
+orbitBy(deltaYaw, deltaPitch) // radians; yaw/pitch clamped to the limits above
+zoomBy(factor)                // multiplies zoom, clamped to ZOOM_MIN..ZOOM_MAX
+resetView()                   // yaw/pitch/zoom back to defaults
+```
+`process(image)`: grid `cols×rows` (≤200, aspect-preserving, never upsampled); per cell average RGB (`#rrggbb`, kept for the 2D fallback) and Rec.709 luminance; luminance → two `boxBlurChannel` passes (radius `max(1, round(max(cols,rows)·0.05))`) → `shapeHeights`: percentile-normalise 2nd..98th → 0..1, then `h = lum·(1−0.35) + dome·0.35` with `dome = clamp01(1 − (u²+v²)·3.2)` (u,v centred coords). The source `ImageData` is kept privately for the texture. Returns a **fresh payload object every call** (this is what invalidates the mesh).
+
+`render(ctx, progress)`: no payload → clear. Else try WebGL; any failure → dispose + 2D fallback for the instance's life (`reset()` re-enables a WebGL attempt). Hidden offscreen canvas + `THREE.WebGLRenderer` (`antialias`, `alpha:false`, `powerPreference:'low-power'`, pixelRatio 1, sRGB output), blitted with `drawImage` (so `RenderContext` stays 2D-only and PNG export captures exactly what is on screen).
+- **Scene:** background `theme.surface`; `AmbientLight(0xffffff, 1.35)`; key `DirectionalLight(0xffffff, 2.3)` at (−3.2, 2.4, 2.6); fill `DirectionalLight(0xffffff, 0.35)` at (3, −1, 2); `PerspectiveCamera(36, aspect, 0.1, 50)`. Ambient-heavy on purpose so the photo keeps its own exposure; the key light rakes across slopes so the relief reads.
+- **Mesh** (rebuilt when `meshBuiltFor !== payload`): picture in the **XY plane facing +Z** (plane 2 units on the longer axis, aspect preserved); vertex `(x,y,z) = ((u−.5)·planeW, (.5−v)·planeH, h·depth·edgeFade(u,v))` with `depth = 0.26·reliefMultiplier·min(planeW,planeH)`; `edgeFade` = smoothstep of `min(u,1−u,v,1−v)/0.1`, so the border is always flat and the outline a clean rectangle; UVs `(u, 1−v)`; triangles `(a,c,b),(b,c,d)` (CCW from +Z); `computeVertexNormals()`. **Material:** `MeshStandardMaterial({ map: texture, roughness 0.92, metalness 0 })` (grey fallback colour if there is no source image). **Texture:** the full photo drawn to a canvas (long edge capped at 1400 via high-quality `drawImage`), `THREE.CanvasTexture`, sRGB, `LinearMipmapLinearFilter`/`LinearFilter`, anisotropy 4.
+- **Camera:** distance = `max(planeH/2, planeW/2/aspect)·1.1 / tan(fov/2) / zoom` (whole picture just fits, on either axis); `yaw = clamp(this.yaw + sway)`, `sway = autoSway ? sin(progress·2π)·0.34 : 0`; position on a sphere: `(sin yaw·cos pitch, sin pitch, cos yaw·cos pitch)·distance`; `lookAt(0,0,0)`. **`progress` matters only when `autoSway` is on.**
+- **Why the limits are what they are:** depth from luminance is only a stylised guess, and any displaced flat photo smears at steep angles (parallax). At ±34° / these depths no reachable view looks broken; a first attempt at ±49° and depth 0.4 visibly stretched faces.
+- **2D fallback** (also what jsdom tests exercise): per cell a raking-light shade from neighbouring heights (`shade = clamp01(0.55 + (dx·−0.6 + dz·−0.75)·1.6 + h·0.15)`), **letterboxed** to the image aspect (uniform square cells, grid centred), and **always fully drawn** (ignores `progress` — the timeline no longer runs by default in 3D, so a progress-driven reveal would leave it blank).
+- `reset()`: disposes WebGL (geometry/material/**texture**/renderer), clears payload + source image, resets the view. `useEngine` also calls `resetView()` on every new upload.
 
 ### 6.13 `export.ts`
 ```ts
@@ -488,21 +512,24 @@ sanitizeFileNameStem(name): string       // strip extension, replace [\\/:*?"<>|
 - **`App.tsx`** — `useRef<HTMLCanvasElement>` → `useEngine(canvasRef)`. Layout: header (title "Vector **Stroke** Engine" with accent span; subtitle "Photo → 5 render engines · client-side") → `.app-body` grid: left `aside.control-rail` = `UploadControl`, `ModeSwitcher`, `SettingsPanel`, `ExportControl`; right `main.stage-wrap` = readout row (dimensions or "Awaiting upload"; status label Idle/Processing…/Ready/Error with `status-ready`/`status-error` classes) + `.stage-frame` (`<canvas>`, four `.stage-bracket--tl/tr/bl/br` corner brackets, and `.stage-empty` "Upload a photo to run it through the {MODE} engine" until an image exists) → `Telemetry` footer.
 - **`useEngine.ts`** — the only stateful glue. Exports `EngineStatus`, `ImageSummary {fileName,fileSizeKB,width,height}`, `ControlsState`, `DEFAULT_CONTROLS`, `CONTROLS_RANGES`, `useEngine(canvasRef)`.
   - Constructs once (refs): `Controller`, `Timeline({durationMs:2000, loop:false})`, cleanup client, and the five modes (registers all; keeps typed refs to `Mode2D/ModeSketch/ModeASCII/Mode3D` for `configure()`).
-  - `ControlsState` (flat): `denoiseEnabled, spotRemovalEnabled, sharpenEnabled, sharpenAmount, posterizeLevels, edgePercentile, pointBudget, strokeWidth, asciiTargetCols (number|null), reliefMultiplier`. `CONTROLS_RANGES.sharpenAmount = {0, 1.5}`; the rest re-export each mode's own range constants.
+  - `ControlsState` (flat): `denoiseEnabled, spotRemovalEnabled, sharpenEnabled, sharpenAmount, posterizeLevels, sketchSensitivity, sketchMinStrokeLength, sketchShading, strokeWidth, asciiTargetCols (number|null), reliefMultiplier, autoSway`. `CONTROLS_RANGES` re-exports each mode's own range constants (`sharpenAmount = {0, 1.5}`).
   - `buildCleanupOptions(controls)` re-nests the 4 cleanup fields over `DEFAULT_CLEANUP_OPTIONS`.
   - `MAX_DIMENSION = 1600` (uploads downscaled so longest edge ≤ 1600).
-  - `applyProcessedOutput(id, output)`: `setCurrentOutput`, `timeline.setLoop(id==='3d')`, `setDuration(durationForMode)`, `timeline.reset()`, `renderFrame()`, `timeline.play()`, `setIsOrbitPlaying(true)`. **Every** mode switch, upload, and settings change goes through this one path.
-  - Durations: sketch = `clamp(totalPoints × 18, 1200, 5000)` ms; histogram 650; ascii 900; 3d 16000 (looping orbit); 2d 700.
+  - `applyProcessedOutput(id, output)`: `setCurrentOutput`, `timeline.setLoop(id==='3d')`, `setDuration(durationForMode)`, `timeline.reset()`, `renderFrame()`, then `timeline.play()` **unless** `id==='3d'` and `controls.autoSway` is off (3D holds still by default; read via `controlsRef`). **Every** mode switch, upload, and settings change goes through this one path.
+  - Durations: sketch = `clamp(totalPoints × 18, 1200, 5000)` ms; histogram 650; ascii 900; 3d 9000 (one sway cycle, only used when Auto sway is on); 2d 700.
   - Effects: `timeline.onTick(renderFrame)`; `timeline.pause()` on unmount; canvas resize via `ResizeObserver` keeps backing store = CSS size × `devicePixelRatio` and redraws; `document.documentElement.dataset.mode = activeMode` (drives CSS theme); `cleanupClient.terminate()` on unmount.
   - `switchMode(id)`: sets active mode; if an image is loaded → `controller.switchTo(id)` + `applyProcessedOutput`; errors → status `error` + message.
-  - `updateControls(partial)`: merges into state; if any cleanup field changed → re-run `cleanupClient.run(rawImageRef, buildCleanupOptions(next))` then `setImage` + reprocess active mode (nothing uploaded yet → preference just remembered); otherwise `configure()` the affected mode(s) then `switchTo(activeMode)`.
-  - `toggleOrbit()`: pause/play the timeline and mirror into `isOrbitPlaying` React state (Timeline is non-reactive, so the label would go stale otherwise).
+  - `updateControls(partial)`: merges into state; if any cleanup field changed → re-run `cleanupClient.run(rawImageRef, buildCleanupOptions(next))` then `setImage` + reprocess active mode (nothing uploaded yet → preference just remembered); otherwise `configure()` the affected mode(s) then `switchTo(activeMode)`. `autoSway` is special: it only calls `mode3D.configure({autoSway})` and plays/pauses the timeline (pausing re-renders once so the view settles) — no reprocess.
+  - **Async race protection (real bug fixed):** cleanup finishes on a worker after a delay (~1 s on a large photo). Callbacks used to close over the `activeMode` from when the run *started*, so switching modes during it was silently undone (buttons said Sketch, canvas showed 2D). Now `activeModeRef` supplies the mode *at completion*, and `cleanupSeqRef` (monotonic id) drops results from superseded runs; an upload superseded this way still completes (summary + `ready`).
+  - **3D camera gestures** (effect attached only while `activeMode === '3d'`): one pointer drag → `mode3D.orbitBy(−dx·0.006, dy·0.006)`; two-pointer pinch and mouse wheel (`exp(−deltaY·0.0015)`, non-passive so the page doesn't scroll) → `zoomBy`; double-click → `resetView()`. Every gesture calls `renderFrame()`. Sets canvas `touch-action: none` and grab/grabbing cursors, and removes everything on cleanup.
+  - `resetView()`: `mode3D.resetView()` + redraw (used by the Reset view button). A new upload also resets the 3D view.
   - `loadFile(file)`: rejects non-`image/*` with "That file isn't an image — try a JPG, PNG, or WebP."; status `loading` → `createImageBitmap` → draw to a canvas at fitted size → `getImageData` (kept in `rawImageRef`) → cleanup (worker) → `controller.setImage` → `switchTo(activeMode)` → `applyProcessedOutput` → summary + status `ready`. Any throw → status `error` with the message.
-  - Returns `{ activeMode, status, errorMessage, imageSummary, currentOutput, controls, updateControls, isOrbitPlaying, toggleOrbit, switchMode, loadFile }`.
+  - Returns `{ activeMode, status, errorMessage, imageSummary, currentOutput, controls, updateControls, resetView, switchMode, loadFile }`.
 - **`UploadControl.tsx`** — props `{ onFile, fileName, errorMessage }`. Dashed dropzone (`role="button"`, keyboard Enter/Space opens the picker, drag-over highlight), hidden `<input type="file" accept="image/*">` (value reset after selection so the same file can be re-picked), filename in accent, error in danger color.
 - **`ModeSwitcher.tsx`** — props `{ activeMode, onSelect }`. `role="tablist"`; buttons in order **2D, Sketch, Histogram, ASCII, 3D**, `role="tab"`, `aria-selected`, `.is-active`.
-- **`SettingsPanel.tsx`** — props `{ activeMode, controls, onUpdateControls, isOrbitPlaying, onToggleOrbit, currentOutput }`. Collapsed-by-default drawer (`aria-expanded`, `+`/`−` chevron). Always shows **Cleanup**: Denoise, Spot removal, Sharpen toggles + "Sharpen amount" slider (0–1.5, step 0.05, disabled when sharpen off). Then a mode section: 2D "Posterize levels" (2–12, step 1); Sketch "Edge sensitivity" (0.70–0.97, step 0.01), "Point budget" (500–8000, step 100), "Stroke thickness" (0.5–3, step 0.1); ASCII "Density (columns)" (8–140, step 1; when `asciiTargetCols` is null the slider shows the current auto column count); 3D "Relief height" (0.25–2.5, step 0.05, shown as `1.00×`) + Pause/Resume orbit button; Histogram shows a note that it has no settings. Private components: `ToggleRow`, `SliderRow`, `ModeControls`.
+- **`SettingsPanel.tsx`** — props `{ activeMode, controls, onUpdateControls, onResetView, currentOutput }`. Collapsed-by-default drawer (`aria-expanded`, `+`/`−` chevron). Always shows **Cleanup**: Denoise, Spot removal, Sharpen toggles + "Sharpen amount" slider (0–1.5, step 0.05, disabled when sharpen off). Then a mode section: 2D "Posterize levels" (2–12, step 1); Sketch "Detail" (0.05–1, step 0.01), "Line cleanup" (4–60, step 1), "Shading" (0–1, step 0.05, shows `off` at 0), "Stroke thickness" (0.5–3, step 0.1); ASCII "Density (columns)" (8–140, step 1; when `asciiTargetCols` is null the slider shows the current auto column count); 3D "Relief height" (0.25–3, step 0.05, shown as `1.00×`), an "Auto sway" toggle, a hint line ("Drag to rotate, scroll or pinch to zoom, double-click to reset."), and a "Reset view" button (class `settings-orbit-button`); Histogram shows a note that it has no settings. Private components: `ToggleRow`, `SliderRow`, `ModeControls`.
 - **`ExportControl.tsx`** — props `{ canvasRef, activeMode, output, fileName }`. Disabled until `output` exists or while busy. Primary button: "Share / Save PNG" if `canShareFiles()` else "Download PNG" → `${stem}-${mode}.png` via `shareOrDownload`. Secondary (only sketch/ascii/histogram): "Download SVG" / "Download TXT" / "Download CSV" → `${stem}-sketch.svg`, `-ascii.txt`, `-histogram.csv`. Status message (accent, or danger on error) auto-clears after 4 s; a dismissed share sheet clears silently.
+- **`App.tsx` 3D hint:** while an image is loaded and mode is 3D, the stage shows `.stage-hint` — "Drag to rotate · Scroll to zoom · Double-click to reset" (absolute, bottom-centre, `pointer-events: none`, so gestures pass through) so people discover the controls without opening Settings.
 - **`Telemetry.tsx`** — footer: `Mode <id>`, and either `Dimensions W × H` + `File name (N KB)` or `No image loaded`.
 - **`styles.css`** — see section 7.1.
 
@@ -572,17 +599,18 @@ Verified locally (dev server): GET → 405; POST `{}` → 400; POST with image a
 
 ---
 
-## 10. Test suites (safety net — 91 tests)
+## 10. Test suites (safety net — 112 tests)
 
 Run with `npm test`. jsdom has no Canvas/WebGL; `test-utils.ts` supplies the stand-ins.
 
 - **`__tests__/test-utils.ts`** — `installDomPolyfills()` (polyfilled `ImageData` for both constructor overloads; mock 2D context on `HTMLCanvasElement.prototype.getContext` with no-op drawing methods, `getImageData`, `measureText` = `len×6`; `toBlob` → microtask Blob; `URL.createObjectURL` → `blob:mock/<n>`), `createMockRenderContext(w,h)`, `createDummyImageData(w=4,h=4)` (deterministic pseudo-random RGB, alpha 255).
-- **`engine.test.ts` (40)** — cleanup pipeline (runs, alpha preserved, finite in-range values); `keepSmallComponents` (large region not fragmented; small isolated region kept); Controller (all five modes registered; clear errors before image / for unknown mode; process→render→reset per mode, incl. `3d`); Mode2D (bounded levels, render-before-process no-op, configure + clamp, aspect-fit); ModeSketch (points ≤ budget, progress reveal, flat image zero-point case, render-before-process, configure raises budget & applies stroke width, clamping); `orderIntoPaths` (matches brute-force reference over 5 randomized configs up to 2 200 points; empty & single point); ModeHistogram (256 buckets sum to pixel count; renders over progress; render-before-process); ModeASCII (grid aspect; luminance→glyph direction; reveal; render-before-process; `targetCols` override/clamp/null; ~2:1 cells on canvas); Mode3D (normalized grid, 2D fallback render across progress, render-before-process, reset + reuse, configure clamp). `console.error` is spied out because THREE logs an expected "Error creating WebGL context" in jsdom before the fallback engages.
+- **`engine.test.ts` (46)** — cleanup pipeline (runs, alpha preserved, finite in-range values); `keepSmallComponents` (large region not fragmented; small isolated region kept); Controller (all five modes registered; clear errors before image / for unknown mode; process→render→reset per mode, incl. `3d`); Mode2D (bounded levels, render-before-process no-op, configure + clamp, aspect-fit); **ModeSketch (11)** — contour strokes from a shapes image stay inside the image and number a handful (not hundreds), longest contour first, hatch strokes appear only when `shading > 0`, a 12%-brightness copy of the same picture gives the same structure (auto-levelling), progress reveals a growing share, **same-colour strokes are batched into ≤4 canvas paths**, flat image → zero points, render-before-process, higher Detail ≥ more contours and larger Line cleanup ≤ fewer, configured stroke width reaches `lineWidth`, `configure()` clamping; ModeHistogram (256 buckets sum to pixel count; renders over progress; render-before-process); ModeASCII (grid aspect; luminance→glyph direction; reveal; render-before-process; `targetCols` override/clamp/null; ~2:1 cells on canvas); **Mode3D (8)** — grid ≤200 sized to aspect with heights in 0..1 and no neighbour jump > 0.35 (smooth), 2D fallback renders, fallback letterboxes to the image aspect, **fallback draws every cell even at progress 0**, camera `orbitBy/zoomBy/resetView` with absurd inputs never throw, `autoSway` accepted, render-before-process, reset + reuse, `configure` clamp. `console.error` is spied out because THREE logs an expected "Error creating WebGL context" in jsdom before the fallback engages.
+- **`sketch-trace.test.ts` (14)** — `buildToneMap` (downscales to working size with correct `sx`; never upsamples; auto-levels a very dark image to the full range; keeps a flat image flat); `gaussianBlur` (preserves mean, smooths a step); `detectEdges`+`traceContours` (edges on a rectangle outline and none in flat interior/background; outline traced into ≤4 long strokes with a simplified vertex count; short specks dropped by `minLength`; **flat and ±1.5 % noise images produce no edges — i.e. no maze**); `simplifyPolyline` / `smoothPolyline`; `buildHatching` (off at 0; hatches only the dark half; both crossing directions appear at high shading).
 - **`export.test.ts` (16)** — `sketchToSVG` (viewBox/size, M/L path in stroke color, drops <2-point layers, escaping); `asciiToText`; `histogramToCSV` (header + 256 rows); `sanitizeFileNameStem`; `canvasToPngBlob`; `downloadText`; `canShareFiles`; `shareOrDownload` (fallback download; shared; dismissed on AbortError; non-abort failure → download).
 - **`cleanup-worker.test.ts` (6)** — `handleCleanupRequest` echoes id/size and cleans; client falls back to sync without `Worker`; fake-worker round trip; multiple in-flight requests matched by `requestId`; buffer copied before transfer; worker error → main-thread fallback.
 - **`api/_shared/__tests__/anthropic-client.test.ts` (7)**, **`handlers.test.ts` (13)**, **`http-error.test.ts` (5)**, **`api/__tests__/vercel-handlers.test.ts` (5)** — key check before fetch; request shape; success text; upstream status; network failure; bad JSON; no text block; validation (missing/oversized); trimming; jpeg media type; path-feeder parse/fence-strip/non-JSON/array/normalization defaults; status mapping; 405/200/400 adapters.
 
-After the cleanup: **92 tests** = the original 91 + 1 new regression test (`Mode3D 2D fallback letterboxes…` in `engine.test.ts`, which now has 40). That test was mutation-checked: re-introducing the old stretch made it fail, restoring the fix made it pass.
+Test count history: 91 original → 92 after the first cleanup (+1 Mode3D letterbox regression test, mutation-checked) → **112** after the Sketch/3D rewrite (Sketch tests rewritten for the new algorithm and the obsolete `orderIntoPaths` suite deleted; +14 `sketch-trace` tests; new Mode3D tests). Two of the new Sketch tests failed on first run and caught real bugs: a flat/white image was being hatched as if black, and hatch strokes alternated tints so canvas batching was defeated (68 draw calls instead of ~4).
 
 ---
 
@@ -601,13 +629,14 @@ After the cleanup: **92 tests** = the original 91 + 1 new regression test (`Mode
 ## 12. How this was verified (so you know what "100% working" rests on)
 
 1. `npm ci` from the shipped lockfile (lockfile unchanged by the install).
-2. `npm run typecheck` → clean (strict, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`).
-3. `npm test` → 92/92.
-4. `npm run build` → clean, emits `dist/assets/cleanup-worker-*.js` (proves Vite detected the worker), no warnings.
-5. `npm run dev` → `/`, `main.tsx`, renamed engine modules and worker module all 200; `/api/describe` GET → 405, POST `{}` → 400, bad JSON → 400, valid body with no key → 502 with the generic message.
-6. **Real browser** (headless Chromium 153 + SwiftShader WebGL, driven by puppeteer against `vite preview`), 43 checks, all passing: title/empty state/mode order; upload → Ready; cleanup ran in a real Web Worker; each of the 5 modes paints; Histogram flips to the light theme and back; 3D creates a **real WebGL2 context** (not the fallback) and its orbit animates, pauses, and resumes; every settings control changes the render (cleanup toggle re-runs the worker, posterize, point budget, ASCII density, relief height); all 5 downloads produce correct files (2D/3D PNG, Sketch SVG, ASCII TXT, Histogram CSV with 257 lines); non-image upload shows the friendly error; 390 px mobile has no horizontal overflow; zero page errors and zero console errors.
-7. Screenshots were inspected by eye: 3D relief renders correctly; Sketch traces the sun/building/window/stripe of a clean image.
+2. `npm run check` → typecheck clean (strict, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), **112/112** unit tests, `vite build` clean with no warnings (emits `dist/assets/cleanup-worker-*.js`).
+3. Dev server: `/`, `main.tsx`, renamed engine modules and worker module all 200; `/api/describe` GET → 405, POST `{}` → 400, bad JSON → 400, valid body with no key → 502 generic message.
+4. **Real browser** (headless Chromium + SwiftShader WebGL, puppeteer against `vite preview`), **47 checks, all passing**, using a real **very dark, noisy portrait** (mean brightness ≈ 11 %): title/empty state/mode order; upload → Ready; cleanup ran in a real Web Worker; each mode paints; Histogram flips to the light theme and back; 3D creates a **real WebGL2 context**; **3D view is frame-for-frame identical 2.5 s after load with no interaction**; drag rotates; wheel zooms; double-click resets to the exact default view; Auto sway ON animates and OFF holds still again; Relief height changes the render; Sketch **Detail** slider draws more and **Shading → off** removes hatching; ASCII density; posterize; cleanup toggle re-runs the worker; all 5 downloads produce correct files (Sketch SVG has many `<path>`s, Histogram CSV has 257 lines); non-image upload shows the friendly error; 390 px mobile has no horizontal overflow; zero page errors / console errors.
+5. Screenshots inspected by eye on the real portrait and the dark variants (Sketch: recognisable face/hair/suit/shuttle as clean continuous lines with shadow hatching, even at 11 % brightness; 3D: sharp, correctly framed picture with a clean rectangular outline and a soft rounded relief).
+6. A separate browser probe confirmed the **Reset view** button restores the exact default frame (compared with Settings open, since opening it changes the page height/scrollbar and therefore the canvas size).
 
-**Not verifiable in the build sandbox:** Google Fonts (network blocked, so Fraunces/JetBrains Mono fell back to serif/monospace in screenshots — they load normally online), a real Vercel deployment of `api/`, the Anthropic call itself (needs your key), and the OS share sheet (`navigator.share`, unavailable in headless Chromium — the download fallback was what got tested).
+**Not verifiable in the build sandbox:** Google Fonts (network blocked → fallback fonts in screenshots), a real Vercel deployment of `api/`, the Anthropic call itself (needs your key), the OS share sheet, and **your actual photo** — I tested a real portrait made artificially dark, not `EDIT1.jpg`.
 
-**Behaviour worth knowing:** Sketch keeps the strongest ~12 % of edge gradients (`edgePercentile 0.88`). On a *noisy, low-structure* image that is mostly noise, so it draws a maze; on real photos with clear subjects it traces them. Raise "Edge sensitivity" toward 0.97 for cleaner lines on noisy photos. This is the original design, unchanged.
+**Behaviour worth knowing**
+- Sketch: **Detail** ↑ = more/finer lines; **Line cleanup** ↑ = drops more small specks; **Shading** 0 = pure line art. Genuinely noisy, low-contrast, structureless images give few or no lines (by design — the old algorithm drew a maze there).
+- 3D depth is a *stylised guess from brightness*, not real depth (a single photo has none). It is deliberately smooth and shallow, and the camera range is limited, because displaced flat photos smear at steep angles.

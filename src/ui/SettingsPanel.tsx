@@ -15,8 +15,7 @@ interface SettingsPanelProps {
   activeMode: ModeId;
   controls: ControlsState;
   onUpdateControls: (partial: Partial<ControlsState>) => void;
-  isOrbitPlaying: boolean;
-  onToggleOrbit: () => void;
+  onResetView: () => void;
   /** Only used to read the ASCII mode's *actual* current column count when asciiTargetCols is still null (auto) — see ModeControls' ascii case. */
   currentOutput: StrokeData | RenderPayload | null;
 }
@@ -25,8 +24,7 @@ export function SettingsPanel({
   activeMode,
   controls,
   onUpdateControls,
-  isOrbitPlaying,
-  onToggleOrbit,
+  onResetView,
   currentOutput,
 }: SettingsPanelProps) {
   const [expanded, setExpanded] = useState(false);
@@ -85,8 +83,8 @@ export function SettingsPanel({
               currentOutput={currentOutput}
             />
             {activeMode === '3d' && (
-              <button type="button" className="export-button export-button--secondary settings-orbit-button" onClick={onToggleOrbit}>
-                {isOrbitPlaying ? 'Pause orbit' : 'Resume orbit'}
+              <button type="button" className="export-button export-button--secondary settings-orbit-button" onClick={onResetView}>
+                Reset view
               </button>
             )}
           </section>
@@ -124,22 +122,31 @@ function ModeControls({
       return (
         <>
           <SliderRow
-            label="Edge sensitivity"
-            value={controls.edgePercentile}
-            min={CONTROLS_RANGES.edgePercentile.min}
-            max={CONTROLS_RANGES.edgePercentile.max}
+            label="Detail"
+            value={controls.sketchSensitivity}
+            min={CONTROLS_RANGES.sketchSensitivity.min}
+            max={CONTROLS_RANGES.sketchSensitivity.max}
             step={0.01}
             format={(v) => v.toFixed(2)}
-            onChange={(v) => onUpdateControls({ edgePercentile: v })}
+            onChange={(v) => onUpdateControls({ sketchSensitivity: v })}
           />
           <SliderRow
-            label="Point budget"
-            value={controls.pointBudget}
-            min={CONTROLS_RANGES.pointBudget.min}
-            max={CONTROLS_RANGES.pointBudget.max}
-            step={100}
+            label="Line cleanup"
+            value={controls.sketchMinStrokeLength}
+            min={CONTROLS_RANGES.sketchMinStrokeLength.min}
+            max={CONTROLS_RANGES.sketchMinStrokeLength.max}
+            step={1}
             format={(v) => String(Math.round(v))}
-            onChange={(v) => onUpdateControls({ pointBudget: Math.round(v) })}
+            onChange={(v) => onUpdateControls({ sketchMinStrokeLength: Math.round(v) })}
+          />
+          <SliderRow
+            label="Shading"
+            value={controls.sketchShading}
+            min={CONTROLS_RANGES.sketchShading.min}
+            max={CONTROLS_RANGES.sketchShading.max}
+            step={0.05}
+            format={(v) => (v <= 0 ? 'off' : v.toFixed(2))}
+            onChange={(v) => onUpdateControls({ sketchShading: v })}
           />
           <SliderRow
             label="Stroke thickness"
@@ -171,15 +178,19 @@ function ModeControls({
     }
     case '3d':
       return (
-        <SliderRow
-          label="Relief height"
-          value={controls.reliefMultiplier}
-          min={CONTROLS_RANGES.reliefMultiplier.min}
-          max={CONTROLS_RANGES.reliefMultiplier.max}
-          step={0.05}
-          format={(v) => `${v.toFixed(2)}\u00d7`}
-          onChange={(v) => onUpdateControls({ reliefMultiplier: v })}
-        />
+        <>
+          <SliderRow
+            label="Relief height"
+            value={controls.reliefMultiplier}
+            min={CONTROLS_RANGES.reliefMultiplier.min}
+            max={CONTROLS_RANGES.reliefMultiplier.max}
+            step={0.05}
+            format={(v) => `${v.toFixed(2)}\u00d7`}
+            onChange={(v) => onUpdateControls({ reliefMultiplier: v })}
+          />
+          <ToggleRow label="Auto sway" checked={controls.autoSway} onChange={(checked) => onUpdateControls({ autoSway: checked })} />
+          <p className="settings-empty-note">Drag to rotate, scroll or pinch to zoom, double-click to reset.</p>
+        </>
       );
     case 'histogram':
       return <p className="settings-empty-note">Histogram has no adjustable settings — it's a direct readout of the cleaned pixel data.</p>;
