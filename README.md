@@ -2,8 +2,8 @@
 
 Client-side photo tool: upload a photo, it is cleaned up (denoise → spot removal → sharpen, in a
 Web Worker), then rendered by one of five engines on a single canvas — **2D** (posterized),
-**Sketch** (animated pen strokes from edge detection), **Histogram** (RGB + luminance chart),
-**ASCII** (character art) and **3D** (WebGL bas-relief). Export as PNG (all modes), SVG (Sketch),
+**Sketch** (animated pen line drawing: traced contours + optional hatching), **Histogram** (RGB + luminance chart),
+**ASCII** (character art) and **3D** (WebGL relief with a stable camera: drag to rotate, scroll to zoom, double-click to reset). Export as PNG (all modes), SVG (Sketch),
 TXT (ASCII) or CSV (Histogram). Everything runs in the browser; no key or server is needed.
 
 ## Run
@@ -13,7 +13,7 @@ Requires Node `^20.19 || ^22.12 || >=24`.
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 92 unit tests (vitest + jsdom)
+npm test           # 112 unit tests (vitest + jsdom)
 npm run build      # typecheck + production build -> dist/
 npm run preview    # serve dist/
 npm run check      # typecheck + test + build in one go

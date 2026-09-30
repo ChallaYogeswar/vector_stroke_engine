@@ -5,8 +5,9 @@ import { Mode2D, DEFAULT_MODE2D_OPTIONS, MODE2D_POSTERIZE_LEVELS_RANGE } from '.
 import {
   ModeSketch,
   DEFAULT_SKETCH_OPTIONS,
-  SKETCH_EDGE_PERCENTILE_RANGE,
-  SKETCH_POINT_BUDGET_RANGE,
+  SKETCH_SENSITIVITY_RANGE,
+  SKETCH_MIN_STROKE_LENGTH_RANGE,
+  SKETCH_SHADING_RANGE,
   SKETCH_STROKE_WIDTH_RANGE,
 } from '../engine/modes/mode-sketch';
 import { ModeHistogram } from '../engine/modes/mode-histogram';
@@ -51,11 +52,14 @@ export interface ControlsState {
   sharpenEnabled: boolean;
   sharpenAmount: number;
   posterizeLevels: number;
-  edgePercentile: number;
-  pointBudget: number;
+  sketchSensitivity: number;
+  sketchMinStrokeLength: number;
+  sketchShading: number;
   strokeWidth: number;
   asciiTargetCols: number | null;
   reliefMultiplier: number;
+  /** Gentle back-and-forth camera sway in 3D. Off by default: the view holds still. */
+  autoSway: boolean;
 }
 
 export const DEFAULT_CONTROLS: ControlsState = {
@@ -64,19 +68,22 @@ export const DEFAULT_CONTROLS: ControlsState = {
   sharpenEnabled: DEFAULT_CLEANUP_OPTIONS.sharpen.enabled,
   sharpenAmount: DEFAULT_CLEANUP_OPTIONS.sharpen.amount,
   posterizeLevels: DEFAULT_MODE2D_OPTIONS.posterizeLevels,
-  edgePercentile: DEFAULT_SKETCH_OPTIONS.edgePercentile,
-  pointBudget: DEFAULT_SKETCH_OPTIONS.pointBudget,
+  sketchSensitivity: DEFAULT_SKETCH_OPTIONS.sensitivity,
+  sketchMinStrokeLength: DEFAULT_SKETCH_OPTIONS.minStrokeLength,
+  sketchShading: DEFAULT_SKETCH_OPTIONS.shading,
   strokeWidth: DEFAULT_SKETCH_OPTIONS.strokeWidth,
   asciiTargetCols: DEFAULT_ASCII_OPTIONS.targetCols,
   reliefMultiplier: DEFAULT_MODE3D_OPTIONS.reliefMultiplier,
+  autoSway: DEFAULT_MODE3D_OPTIONS.autoSway,
 };
 
 /** Re-exported so the settings panel can drive slider min/max from the same numbers the engines actually clamp against, rather than duplicating them. */
 export const CONTROLS_RANGES = {
   sharpenAmount: { min: 0, max: 1.5 },
   posterizeLevels: MODE2D_POSTERIZE_LEVELS_RANGE,
-  edgePercentile: SKETCH_EDGE_PERCENTILE_RANGE,
-  pointBudget: SKETCH_POINT_BUDGET_RANGE,
+  sketchSensitivity: SKETCH_SENSITIVITY_RANGE,
+  sketchMinStrokeLength: SKETCH_MIN_STROKE_LENGTH_RANGE,
+  sketchShading: SKETCH_SHADING_RANGE,
   strokeWidth: SKETCH_STROKE_WIDTH_RANGE,
   asciiTargetCols: ASCII_TARGET_COLS_RANGE,
   reliefMultiplier: MODE3D_RELIEF_MULTIPLIER_RANGE,
@@ -156,6 +163,13 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
   useEffect(() => () => cleanupClient.terminate(), [cleanupClient]);
 
   const [activeMode, setActiveMode] = useState<ModeId>('2d');
+  // Async work (cleanup finishing on the worker) must apply to the mode the
+  // user is on when it *finishes*, not the one they were on when it started —
+  // otherwise switching modes during a cleanup re-run gets silently undone.
+  const activeModeRef = useRef<ModeId>(activeMode);
+  activeModeRef.current = activeMode;
+  // Monotonic id for cleanup runs: a result from a superseded run is dropped.
+  const cleanupSeqRef = useRef(0);
   const [status, setStatus] = useState<EngineStatus>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [imageSummary, setImageSummary] = useState<ImageSummary | null>(null);
@@ -166,13 +180,10 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
   // for its SVG/TXT/CSV exports) has to be copied out on every process()
   // call, same treatment as imageSummary/activeMode/status above.
   const [currentOutput, setCurrentOutput] = useState<StrokeData | RenderPayload | null>(null);
-  // Timeline's own `running` flag (read via toggleOrbit below) actually
-  // drives the rAF loop — this is a separate mirror of it into React state,
-  // for the same reason currentOutput mirrors Controller's output: Timeline
-  // is a plain, non-reactive class, so calling timeline.play()/pause()
-  // alone doesn't trigger a re-render, and the orbit button's label would
-  // silently go stale without something reactive to read.
-  const [isOrbitPlaying, setIsOrbitPlaying] = useState(true);
+  // Latest controls, readable from callbacks that must not re-create on every
+  // slider tick (applyProcessedOutput decides from this whether 3D auto-sways).
+  const controlsRef = useRef<ControlsState>(controls);
+  controlsRef.current = controls;
 
   const renderFrame = useCallback(() => {
     const canvas = canvasRef.current;
@@ -196,23 +207,22 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
       timeline.setDuration(durationForMode(id, output));
       timeline.reset();
       renderFrame();
-      timeline.play();
-      setIsOrbitPlaying(true); // keep the mirror above in sync — see its comment
+      // 3D holds still (a stable, capture-ready view) unless the user turned
+      // Auto sway on; every other mode plays its one-shot reveal.
+      if (id !== '3d' || controlsRef.current.autoSway) timeline.play();
     },
     [renderFrame, timeline],
   );
 
   // Redraw whenever the timeline ticks. 2D ignores `progress` and just
-  // redraws the same frame for its settle duration; Sketch, Histogram,
-  // ASCII, and 3D all animate against it (stroke reveal, bar rise-in,
-  // typewriter reveal, camera orbit, respectively).
+  // redraws the same frame for its settle duration; Sketch, Histogram and
+  // ASCII animate against it (stroke reveal, bar rise-in, typewriter reveal);
+  // 3D only uses it for the optional Auto sway.
   useEffect(() => timeline.onTick(renderFrame), [timeline, renderFrame]);
 
-  // Mode3D loops its Timeline for a continuous camera orbit (see
-  // Timeline.setLoop / mode-3d.ts). Every other mode stops calling rAF on
-  // its own once it hits its one-shot duration, so this cleanup was a
-  // no-op before; it's required now so leaving the page/component while on
-  // 3D doesn't keep requestAnimationFrame firing forever.
+  // 3D's Auto sway loops its Timeline. Every other mode stops calling rAF on
+  // its own once it hits its one-shot duration; this cleanup makes sure
+  // leaving the page while sway is on doesn't keep requestAnimationFrame firing.
   useEffect(() => () => timeline.pause(), [timeline]);
 
   // Keep the canvas backing store matched to its displayed size and DPR.
@@ -238,6 +248,83 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
     return () => observer.disconnect();
   }, [canvasRef, renderFrame]);
 
+  // 3D camera controls: drag to rotate, wheel / pinch to zoom, double-click to
+  // reset. Mode3D clamps yaw/pitch/zoom, so no gesture can reach a bad view.
+  // Only attached while 3D is active; every gesture redraws immediately.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const mode3D = mode3DRef.current;
+    if (!canvas || !mode3D || activeMode !== '3d') return;
+
+    const ROTATE_RADIANS_PER_PX = 0.006;
+    const pointers = new Map<number, { x: number; y: number }>();
+    let pinchDistance = 0;
+
+    const pinchSpan = () => {
+      const [a, b] = [...pointers.values()];
+      return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
+    };
+
+    const onDown = (e: PointerEvent) => {
+      canvas.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pointers.size === 2) pinchDistance = pinchSpan();
+      canvas.style.cursor = 'grabbing';
+    };
+    const onMove = (e: PointerEvent) => {
+      const prev = pointers.get(e.pointerId);
+      if (!prev) return;
+      const next = { x: e.clientX, y: e.clientY };
+      pointers.set(e.pointerId, next);
+      if (pointers.size === 1) {
+        mode3D.orbitBy(-(next.x - prev.x) * ROTATE_RADIANS_PER_PX, (next.y - prev.y) * ROTATE_RADIANS_PER_PX);
+      } else if (pointers.size === 2) {
+        const span = pinchSpan();
+        if (pinchDistance > 0 && span > 0) mode3D.zoomBy(span / pinchDistance);
+        pinchDistance = span;
+      }
+      renderFrame();
+    };
+    const onUp = (e: PointerEvent) => {
+      pointers.delete(e.pointerId);
+      pinchDistance = 0;
+      if (pointers.size === 0) canvas.style.cursor = 'grab';
+    };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      mode3D.zoomBy(Math.exp(-e.deltaY * 0.0015));
+      renderFrame();
+    };
+    const onDouble = () => {
+      mode3D.resetView();
+      renderFrame();
+    };
+
+    canvas.style.touchAction = 'none';
+    canvas.style.cursor = 'grab';
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('dblclick', onDouble);
+    return () => {
+      canvas.style.touchAction = '';
+      canvas.style.cursor = '';
+      canvas.removeEventListener('pointerdown', onDown);
+      canvas.removeEventListener('pointermove', onMove);
+      canvas.removeEventListener('pointerup', onUp);
+      canvas.removeEventListener('pointercancel', onUp);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('dblclick', onDouble);
+    };
+  }, [activeMode, canvasRef, renderFrame]);
+
+  const resetView = useCallback(() => {
+    mode3DRef.current?.resetView();
+    renderFrame();
+  }, [renderFrame]);
+
   // Mode-dependent theme (build-spec section 6): set on <html> so every CSS
   // rule can key off it via `html[data-mode="..."]` without prop drilling.
   useEffect(() => {
@@ -259,16 +346,6 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
     [applyProcessedOutput, controller],
   );
 
-  const toggleOrbit = useCallback(() => {
-    if (timeline.isRunning) {
-      timeline.pause();
-      setIsOrbitPlaying(false);
-    } else {
-      timeline.play();
-      setIsOrbitPlaying(true);
-    }
-  }, [timeline]);
-
   const updateControls = useCallback(
     (partial: Partial<ControlsState>) => {
       const next: ControlsState = { ...controls, ...partial };
@@ -278,12 +355,15 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
 
       if (changesCleanup) {
         if (!rawImageRef.current) return; // nothing uploaded yet — the preference is remembered for next time
+        const seq = ++cleanupSeqRef.current;
         cleanupClient.run(rawImageRef.current, buildCleanupOptions(next)).then((cleaned) => {
+          if (seq !== cleanupSeqRef.current) return; // a newer cleanup run superseded this one
           cleanedImageRef.current = cleaned;
           controller.setImage(cleaned);
+          const modeNow = activeModeRef.current;
           try {
-            const output = controller.switchTo(activeMode);
-            applyProcessedOutput(activeMode, output);
+            const output = controller.switchTo(modeNow);
+            applyProcessedOutput(modeNow, output);
           } catch (err) {
             setStatus('error');
             setErrorMessage(err instanceof Error ? err.message : 'Failed to apply the updated settings.');
@@ -292,15 +372,28 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
         return;
       }
 
+      if ('autoSway' in partial) {
+        mode3DRef.current?.configure({ autoSway: next.autoSway });
+        if (activeMode === '3d') {
+          if (next.autoSway) timeline.play();
+          else {
+            timeline.pause();
+            renderFrame(); // settle back onto the stable view
+          }
+        }
+        if (Object.keys(partial).length === 1) return; // nothing to reprocess
+      }
+
       if (!cleanedImageRef.current) return; // nothing uploaded yet
 
       if ('posterizeLevels' in partial) {
         mode2DRef.current?.configure({ posterizeLevels: next.posterizeLevels });
       }
-      if ('edgePercentile' in partial || 'pointBudget' in partial || 'strokeWidth' in partial) {
+      if ('sketchSensitivity' in partial || 'sketchMinStrokeLength' in partial || 'sketchShading' in partial || 'strokeWidth' in partial) {
         modeSketchRef.current?.configure({
-          edgePercentile: next.edgePercentile,
-          pointBudget: next.pointBudget,
+          sensitivity: next.sketchSensitivity,
+          minStrokeLength: next.sketchMinStrokeLength,
+          shading: next.sketchShading,
           strokeWidth: next.strokeWidth,
         });
       }
@@ -319,7 +412,7 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
         setErrorMessage(err instanceof Error ? err.message : 'Failed to apply the updated settings.');
       }
     },
-    [activeMode, applyProcessedOutput, cleanupClient, controller, controls],
+    [activeMode, applyProcessedOutput, cleanupClient, controller, controls, renderFrame, timeline],
   );
 
   const loadFile = useCallback(
@@ -347,12 +440,18 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
         const rawImageData = decodeCtx.getImageData(0, 0, width, height);
         rawImageRef.current = rawImageData;
 
+        const seq = ++cleanupSeqRef.current;
         const cleaned = await cleanupClient.run(rawImageData, buildCleanupOptions(controls));
-        cleanedImageRef.current = cleaned;
-
-        controller.setImage(cleaned);
-        const output = controller.switchTo(activeMode);
-        applyProcessedOutput(activeMode, output);
+        // If a newer cleanup run (a settings change made while this decoded)
+        // took over, it applies its own result; this upload still completes below.
+        if (seq === cleanupSeqRef.current) {
+          cleanedImageRef.current = cleaned;
+          mode3DRef.current?.resetView(); // a new photo starts from the default framing
+          controller.setImage(cleaned);
+          const modeNow = activeModeRef.current;
+          const output = controller.switchTo(modeNow);
+          applyProcessedOutput(modeNow, output);
+        }
 
         setImageSummary({ fileName: file.name, fileSizeKB: Math.round(file.size / 1024), width, height });
         setStatus('ready');
@@ -372,8 +471,7 @@ export function useEngine(canvasRef: RefObject<HTMLCanvasElement>) {
     currentOutput,
     controls,
     updateControls,
-    isOrbitPlaying,
-    toggleOrbit,
+    resetView,
     switchMode,
     loadFile,
   };
@@ -384,7 +482,7 @@ const SKETCH_MIN_DURATION_MS = 1200;
 const SKETCH_MAX_DURATION_MS = 5000;
 const HISTOGRAM_DURATION_MS = 650;
 const ASCII_DURATION_MS = 900; // long enough for the typewriter reveal to read as an effect, not an instant dump
-const ROTATE_DURATION_MS = 16000; // one full 3D camera orbit — slow and ambient, not dizzying; Timeline loops this for '3d'
+const SWAY_DURATION_MS = 9000; // one left-right-left 3D sway cycle (only runs when Auto sway is on)
 const STATIC_DURATION_MS = 700; // 2D: no real animation, just a settle frame
 
 function durationForMode(id: ModeId, output: StrokeData | RenderPayload): number {
@@ -394,7 +492,7 @@ function durationForMode(id: ModeId, output: StrokeData | RenderPayload): number
   }
   if (id === 'histogram') return HISTOGRAM_DURATION_MS;
   if (id === 'ascii') return ASCII_DURATION_MS;
-  if (id === '3d') return ROTATE_DURATION_MS;
+  if (id === '3d') return SWAY_DURATION_MS;
   return STATIC_DURATION_MS;
 }
 

@@ -1,3 +1,10 @@
+> **SUPERSEDED IN PART (Sketch + 3D controls).** This spec describes the controls as first built.
+> Sketch's "Edge sensitivity" and "Point budget" and 3D's "Pause/Resume orbit" no longer exist:
+> Sketch now has **Detail / Line cleanup / Shading / Stroke thickness**, and 3D has **Relief height /
+> Auto sway / Reset view** plus drag-to-rotate, scroll-to-zoom and double-click reset. The current
+> behaviour is documented in `PROJECT_MAP.md` sections 6.9, 6.12 and 7; the rest of this file
+> (Cleanup controls, 2D, ASCII, the "one rule" for reprocessing, performance notes) still applies.
+
 # Phase 7 — Performance & Interactive Controls
 
 Follow-up to build-spec.md (Phases 0-6, all shipped). Scoped from a second
